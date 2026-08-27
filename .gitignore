@@ -1,0 +1,120 @@
+# ============================================================
+# Python
+# ============================================================
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# ============================================================
+# Virtual environments
+# ============================================================
+
+.venv/
+venv/
+env/
+ENV/
+
+# ============================================================
+# IDEs / Editors
+# ============================================================
+
+.idea/
+.vscode/
+
+# Cursor
+.cursor/
+
+# Windsurf
+.windsurf/
+
+# ============================================================
+# Remote development / server state
+# ============================================================
+
+.cursor-server/
+.vscode-server/
+.windsurf-server/
+
+# ============================================================
+# Lightning AI Studio
+# ============================================================
+
+.lightning_studio/
+
+# ============================================================
+# OS / temporary files
+# ============================================================
+
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# ============================================================
+# Logs
+# ============================================================
+
+*.log
+logs/
+
+# ============================================================
+# Local environment / secrets
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+# ============================================================
+# Local experiment outputs
+# ============================================================
+
+# Large generated artifacts
+outputs/
+results/
+runs/
+artifacts/
+
+# Model checkpoints
+checkpoints/
+*.ckpt
+*.pth
+*.pt
+*.safetensors
+
+# Reconstruction maps / heatmaps
+reconstruction_maps/
+heatmaps/
+
+# ============================================================
+# Datasets
+# ============================================================
+
+# Raw datasets should never enter Git
+data/
+datasets/
+
+# INP-X local dataset
+inp-x-aeroblade/data/
+inp-x-aeroblade/datasets/
+
+# ============================================================
+# Hugging Face / model caches
+# ============================================================
+
+.huggingface/
+huggingface/
+.cache/

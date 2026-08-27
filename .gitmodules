@@ -1,0 +1,3 @@
+[submodule "inp-x-aeroblade/external/aeroblade"]
+	path = inp-x-aeroblade/external/aeroblade
+	url = https://github.com/jonasricker/aeroblade
