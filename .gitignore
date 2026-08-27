@@ -43,9 +43,9 @@ ENV/
 # Remote development / server state
 # ============================================================
 
-.cursor-server/
-.vscode-server/
-.windsurf-server/
+.cursor-server
+.vscode-server
+.windsurf-server
 
 # ============================================================
 # Lightning AI Studio
