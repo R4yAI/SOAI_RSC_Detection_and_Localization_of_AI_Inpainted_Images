@@ -1,0 +1,4 @@
+dataset_root: "mock_data/INP_X_ROOT"
+manifest_dir: "manifests"
+output_root: "outputs"
+seed: 42
