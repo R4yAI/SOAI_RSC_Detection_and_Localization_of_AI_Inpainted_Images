@@ -99,7 +99,7 @@ def compute_streaming_path(img_orig_tensor, ae, lpips_model, generator, device):
     return out_upsampled[0, 0].cpu().numpy()
 
 def main():
-    manifest_path = Path("manifests/manifest_smoke.csv")
+    manifest_path = Path("manifests/manifest_test-data_smoke.csv")
     if not manifest_path.exists():
         print(f"Manifest not found: {manifest_path}")
         return

@@ -1,0 +1,15 @@
+{
+  "manifest_test-data_full.csv": "517eb231287af1502ed4d5adb31544b3050c24479295024d08176ca27f447a7d",
+  "manifest_test-data_pilot.csv": "2ca56cd0ffc95ba4cd8be3ebe2d184fdb86debbd705735bf43078b38e746af27",
+  "manifest_test-data_smoke.csv": "7d079ffa8fa940b7182a051e4e721a673317ecb53e7de5e703d906321606f8e1",
+  "manifest_test-data_shard_00.csv": "563bb45d8135c3d563b9234ee730b86e4384d11498c0fe8897d96a6a9b44caae",
+  "manifest_test-data_shard_01.csv": "d35ec9647b234ef3f6bc1215c0e03a002b60e611284976186f247582bef47d06",
+  "manifest_test-data_shard_02.csv": "b4b5019b18402a1da8c2d14addcae0c22e9350bdde6cf563a06dfc62416e2221",
+  "manifest_test-data_shard_03.csv": "398f88ef34d40442e944f629c12d3a6fcca52c563de7234f1e76b060096196a6",
+  "manifest_test-data_shard_04.csv": "6c4ecd6c4b488f2d602c810fb3f3b3b3e26f3ea3ba228402f28747a360f746d8",
+  "manifest_test-data_shard_05.csv": "d47ec57d87f6de91dd01f9bf89883a0d33d8f2e7840973410539a0017a6bba8a",
+  "manifest_test-data_shard_06.csv": "9942b80cb30fb71bc95d1d87cfac2cf73da0da952f026355f63f97a83cbd3580",
+  "manifest_test-data_shard_07.csv": "eed0e79451fb0fbfca38939a308d9476ae377c405a0c05df831b3a4e0cc69a56",
+  "manifest_test-data_shard_08.csv": "75539eeb1e31bf4bd84b8b62414c9b27cd6b1f7cc8c910acfe3a710bf3b0b45c",
+  "manifest_test-data_shard_09.csv": "48a93bc53df90df6c2967295344612d88cacc3886ca94bdc756deb1adbce3928"
+}

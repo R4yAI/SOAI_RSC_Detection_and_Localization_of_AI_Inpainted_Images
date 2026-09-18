@@ -108,8 +108,7 @@ data/
 datasets/
 
 # INP-X local dataset
-inp-x-aeroblade/data/
-inp-x-aeroblade/datasets/
+inp-x-aeroblade/INP_X_ROOT/
 
 # ============================================================
 # Hugging Face / model caches

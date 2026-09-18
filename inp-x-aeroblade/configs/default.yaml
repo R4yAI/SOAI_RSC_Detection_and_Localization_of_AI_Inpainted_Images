@@ -1,4 +1,18 @@
-dataset_root: "mock_data/INP_X_ROOT"
+# INP-X and AEROBLADE Experiment Configuration
+
+# Dataset paths
+dataset_root: "INP_X_ROOT/inpainting_exchange"  # Base root containing test-data/ and train-data/
+split: "test-data"                    # "test-data" (10K triplets) or "train-data" (20K triplets)
 manifest_dir: "manifests"
 output_root: "outputs"
+
+# Experiment parameters
 seed: 42
+forensic_autoencoder: "runwayml/stable-diffusion-v1-5"  # "SD1" baseline
+distance_metric: "lpips_vgg_2"                          # LPIPS VGG Layer 2
+batch_size: 1
+num_workers: 2
+map_dtype: "float16"
+
+# Sharding & Execution
+num_shards: 10
