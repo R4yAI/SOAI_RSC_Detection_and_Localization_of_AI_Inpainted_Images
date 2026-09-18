@@ -1,0 +1,30 @@
+experiment: aeroblade_x_inpx_smoke_test
+manifest: /teamspace/studios/this_studio/inp-x-aeroblade/manifests/manifest_test-data_smoke.csv
+output_dir: /teamspace/studios/this_studio/inp-x-aeroblade/results/aeroblade/smoke_test
+forensic_autoencoder: runwayml/stable-diffusion-v1-5
+lpips_distance: LPIPS
+lpips_backbone: vgg
+lpips_spatial_layer_index: 2
+latent_sampling_seed: 42
+device: cuda
+save_reconstructions: true
+heatmap_dtype: float16
+heatmap_orientation: positive_reconstruction_error
+upsampling: bilinear_antialias
+input_range: '[0,1] -> [-1,1] for VAE'
+streaming_reconstruction: true
+thresholded_localization_rule: per-image Otsu
+pixel_metrics:
+- pixel_f1
+- dice
+- iou
+- pixel_ap
+- pixel_roc_auc
+- boundary_f1
+image_metrics:
+- accuracy
+- precision
+- recall
+- f1
+- roc_auc
+- pr_auc

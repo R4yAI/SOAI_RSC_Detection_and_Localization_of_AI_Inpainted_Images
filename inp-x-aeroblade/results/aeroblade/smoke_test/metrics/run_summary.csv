@@ -1,0 +1,2 @@
+experiment,manifest,n_samples,n_condition_images,ae,lpips_backbone,lpips_layer,seed,device,elapsed_seconds,heatmap_count,reconstruction_count
+aeroblade_x_inpx_smoke_test,/teamspace/studios/this_studio/inp-x-aeroblade/manifests/manifest_test-data_smoke.csv,20,60,runwayml/stable-diffusion-v1-5,vgg,2,42,cuda,135.04460763931274,60,60
