@@ -7,24 +7,14 @@ lpips_backbone: vgg
 lpips_spatial_layer_index: 2
 latent_sampling_seed: 42
 device: cuda
-save_reconstructions: true
+triplet_batch_size: 2
+save_reconstructions: false
 heatmap_dtype: float16
-heatmap_orientation: positive_reconstruction_error
+score_convention: AEROBLADE native negative error (-E)
+anomaly_map_convention: A(x,y) = -E(x,y) (Option A)
 upsampling: bilinear_antialias
 input_range: '[0,1] -> [-1,1] for VAE'
 streaming_reconstruction: true
-thresholded_localization_rule: per-image Otsu
-pixel_metrics:
-- pixel_f1
-- dice
-- iou
-- pixel_ap
-- pixel_roc_auc
-- boundary_f1
-image_metrics:
-- accuracy
-- precision
-- recall
-- f1
-- roc_auc
-- pr_auc
+thresholded_localization_rules:
+- per-image Otsu on -E
+- swept optimal F1/IoU (IoU_max)

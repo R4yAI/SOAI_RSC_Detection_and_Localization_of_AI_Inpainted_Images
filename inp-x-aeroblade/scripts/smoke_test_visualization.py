@@ -89,7 +89,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Dict, Iterable, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -180,6 +180,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        default=Path("INP_X_ROOT/inpainting_exchange/test-data"),
+        help=(
+            "Root of the INP-X dataset split (containing data/originals, "
+            "data/standard_inpainting, data/inpainting_exchange, and masks/) "
+            "used to resolve source images and ground-truth masks."
+        ),
+    )
+
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("visualizations/aeroblade_x_inpx_smoke_test"),
@@ -189,7 +200,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--n-qualitative",
         type=int,
-        default=10,
+        default=20,
         help="Number of samples for qualitative heatmap panels.",
     )
 
@@ -211,6 +222,15 @@ def parse_args() -> argparse.Namespace:
         "--show",
         action="store_true",
         help="Display figures interactively in addition to saving them.",
+    )
+
+    parser.add_argument(
+        "--difference-maps",
+        action="store_true",
+        help=(
+            "Also generate the per-sample Standard - INP-X heatmap "
+            "difference figures (off by default)."
+        ),
     )
 
     return parser.parse_args()
@@ -377,21 +397,33 @@ def discover_heatmap_files(
         if condition is None:
             continue
 
-        # Remove common condition tokens from the filename to recover
-        # the sample identifier. This is intentionally conservative.
-        sample_id = stem
+        # Recover the sample identifier from the filename. Two conventions
+        # are supported:
+        #
+        # 1. Metadata-rich filenames where fields are joined with a double
+        #    underscore, e.g.
+        #    "sample-<id>__condition__ae-...__distance-...__..._original.npy"
+        #    Here the sample id is the first "__"-delimited segment (with an
+        #    optional leading "sample-" prefix stripped).
+        # 2. Simple filenames where the condition token is just appended or
+        #    prefixed directly onto the sample id, e.g. "<id>_original.npy".
+        if "__" in stem:
+            first_segment = stem.split("__", 1)[0]
+            sample_id = re.sub(r"^sample-", "", first_segment)
+        else:
+            sample_id = stem
 
-        for token in [
-            "_original",
-            "-original",
-            "_standard",
-            "-standard",
-            "_inpx",
-            "-inpx",
-        ]:
-            sample_id = sample_id.replace(token, "")
+            for token in [
+                "_original",
+                "-original",
+                "_standard",
+                "-standard",
+                "_inpx",
+                "-inpx",
+            ]:
+                sample_id = sample_id.replace(token, "")
 
-        sample_id = sample_id.strip("_-")
+            sample_id = sample_id.strip("_-")
 
         mapping[(sample_id, condition)] = path
 
@@ -436,44 +468,139 @@ def load_heatmap(path: Path) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Image discovery
 # ---------------------------------------------------------------------------
+#
+# The INP-X dataset (see https://github.com/emirhanbilgic/INP-X) lays out
+# test-split images and masks as:
+#
+#   <dataset_root>/
+#     data/
+#       originals/<Dataset>/<original_stem>.jpg
+#       standard_inpainting/<Dataset>/<item_id>_<Dataset>_<Generator>.jpg
+#       inpainting_exchange/<Dataset>/<item_id>_<Dataset>_<Generator>_simple.jpg
+#     masks/
+#       <Dataset>_masks/<item_id>.jpg
+#
+# where <item_id> is the portion of sample_metrics' sample_id left over
+# after stripping the "<split>_<Dataset>_<Generator>_" prefix (e.g. sample_id
+# "test-data_CelebAHQ_OpenJourney_10389_r_ear" -> item_id "10389_r_ear").
+# The original image's filename additionally drops a dataset-specific
+# region/instance suffix (e.g. "_r_ear", "_instance075", "_008") that isn't
+# recoverable by a fixed regex, so it's resolved by matching item_id against
+# the real filenames on disk instead.
+
+_ORIGINAL_STEM_CACHE: dict[Path, set[str]] = {}
+
+
+def parse_item_id(
+    sample_id: str,
+    dataset: str,
+    generator: str,
+) -> Optional[str]:
+    """Recover the dataset-relative item id from a sample_id, given the row's
+    known dataset and generator (sample_id = "<split>_<dataset>_<generator>_<item_id>")."""
+    for split_name in ("test-data", "train-data"):
+        prefix = f"{split_name}_{dataset}_{generator}_"
+
+        if sample_id.startswith(prefix):
+            return sample_id[len(prefix):]
+
+    return None
+
+
+def _original_stems(dataset_root: Path, dataset: str) -> set[str]:
+    """List (and cache) the original-image filename stems for one dataset."""
+    directory = dataset_root / "data" / "originals" / dataset
+
+    if directory not in _ORIGINAL_STEM_CACHE:
+        if directory.exists():
+            _ORIGINAL_STEM_CACHE[directory] = {
+                path.stem for path in directory.iterdir() if path.is_file()
+            }
+        else:
+            _ORIGINAL_STEM_CACHE[directory] = set()
+
+    return _ORIGINAL_STEM_CACHE[directory]
+
+
+def _resolve_original_stem(
+    item_id: str,
+    known_stems: set[str],
+) -> Optional[str]:
+    """
+    Recover the original image's filename stem from the item id by
+    progressively dropping trailing '_'-delimited tokens: the item id is
+    the original stem plus a dataset-specific region/instance suffix.
+    """
+    parts = item_id.split("_")
+
+    for split_index in range(len(parts), 0, -1):
+        candidate = "_".join(parts[:split_index])
+
+        if candidate in known_stems:
+            return candidate
+
+    return None
+
 
 def find_image_for_sample(
     row: pd.Series,
     condition: str,
+    dataset_root: Path,
 ) -> Optional[Path]:
-    """Resolve the image path for a sample-condition row in sample metrics."""
-    column_map = {
-        "original": "original_path",
-        "standard": "standard_inpainting_path",
-        "inpx": "inpainting_exchange_path",
-    }
+    """Resolve an original/standard/inpx image path from the INP-X dataset layout."""
+    dataset = str(row.get("source_dataset", ""))
+    generator = str(row.get("source_generator", ""))
+    sample_id = str(row.get("sample_id", ""))
 
-    column = column_map.get(condition)
+    item_id = parse_item_id(sample_id, dataset, generator)
 
-    if column is None or column not in row.index:
+    if item_id is None:
         return None
 
-    value = row[column]
+    if condition == "original":
+        known_stems = _original_stems(dataset_root, dataset)
+        stem = _resolve_original_stem(item_id, known_stems)
 
-    if pd.isna(value):
+        if stem is None:
+            return None
+
+        path = dataset_root / "data" / "originals" / dataset / f"{stem}.jpg"
+
+    elif condition == "standard":
+        path = (
+            dataset_root
+            / "data" / "standard_inpainting" / dataset
+            / f"{item_id}_{dataset}_{generator}.jpg"
+        )
+
+    elif condition == "inpx":
+        path = (
+            dataset_root
+            / "data" / "inpainting_exchange" / dataset
+            / f"{item_id}_{dataset}_{generator}_simple.jpg"
+        )
+
+    else:
         return None
-
-    path = Path(str(value))
 
     return path if path.exists() else None
 
 
-def find_mask_for_sample(row: pd.Series) -> Optional[Path]:
-    """Resolve the ground-truth mask path from a metrics row when available."""
-    if "mask_path" not in row.index:
+def find_mask_for_sample(
+    row: pd.Series,
+    dataset_root: Path,
+) -> Optional[Path]:
+    """Resolve the ground-truth mask path from the INP-X dataset layout."""
+    dataset = str(row.get("source_dataset", ""))
+    generator = str(row.get("source_generator", ""))
+    sample_id = str(row.get("sample_id", ""))
+
+    item_id = parse_item_id(sample_id, dataset, generator)
+
+    if item_id is None:
         return None
 
-    value = row["mask_path"]
-
-    if pd.isna(value):
-        return None
-
-    path = Path(str(value))
+    path = dataset_root / "masks" / f"{dataset}_masks" / f"{item_id}.jpg"
 
     return path if path.exists() else None
 
@@ -534,21 +661,86 @@ def overlay_heatmap(
     ).clip(0, 1)
 
 
+def save_visualization(
+    image_paths: Dict[str, Path],
+    mask: Optional[np.ndarray],
+    heatmaps: Dict[str, np.ndarray],
+    output: Path,
+    title: Optional[str] = None,
+    dpi: int = 150,
+    show: bool = False,
+) -> None:
+    """Save a compact diagnostic panel for qualitative alignment and signal inspection."""
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    axes = axes.ravel()
+
+    for ax, condition in zip(axes[:3], CONDITION_ORDER):
+        image_path = image_paths.get(condition)
+
+        if image_path is not None:
+            with Image.open(image_path) as image:
+                ax.imshow(image.convert("RGB"))
+        else:
+            ax.text(0.5, 0.5, "image unavailable", ha="center", va="center")
+
+        ax.set_title(CONDITION_LABELS.get(condition, condition))
+        ax.axis("off")
+
+    if mask is not None:
+        axes[3].imshow(mask, cmap="gray")
+    else:
+        axes[3].text(0.5, 0.5, "mask unavailable", ha="center", va="center")
+
+    axes[3].set_title("ground-truth mask")
+    axes[3].axis("off")
+
+    for ax, condition in zip(axes[4:], CONDITION_ORDER):
+        heatmap = heatmaps.get(condition)
+        label = CONDITION_LABELS.get(condition, condition)
+
+        if heatmap is not None:
+            im = ax.imshow(heatmap, vmin=0.0, vmax=0.3)
+            # ax.imshow(mask, alpha=0.25)  //Uncomment this if you want to see the mask plotted above the heatmap
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        else:
+            ax.text(0.5, 0.5, "heatmap unavailable", ha="center", va="center")
+
+        ax.set_title(f"{label}: positive LPIPS error")
+        ax.axis("off")
+
+    axes[7].axis("off")
+
+    if title:
+        fig.suptitle(title, fontsize=13)
+
+    fig.tight_layout()
+    fig.savefig(output, dpi=dpi, bbox_inches="tight")
+
+    if show:
+        plt.show()
+
+    plt.close(fig)
+
+
+_DEBUG_STATE = {"printed": False}
+
+
 def plot_comparative_sample(
     sample_id: str,
     sample_metrics: pd.DataFrame,
     heatmap_mapping: dict[tuple[str, str], Path],
+    dataset_root: Path,
     output_path: Path,
     metadata: dict[str, str],
     dpi: int,
     show: bool,
 ) -> bool:
     """
-    Generate a multi-row qualitative panel for one sample.
+    Generate a compact diagnostic panel for one sample.
 
-    Rows contain source images, reconstruction-error heatmaps, overlays, and
-    the ground-truth mask. Standard and INP-X are directly comparable while
-    the original image acts as an authentic control.
+    The panel shows source images, the ground-truth mask, and raw
+    reconstruction-error heatmaps (with a colorbar) for each condition,
+    laid out for quick qualitative alignment and signal inspection.
     """
     rows = sample_metrics[
         sample_metrics["sample_id"].astype(str) == str(sample_id)
@@ -571,121 +763,76 @@ def plot_comparative_sample(
     if not conditions:
         return False
 
-    n_columns = len(conditions)
+    # One-time diagnostic dump for the first sample only, so we can see
+    # exactly why an image/mask/heatmap path failed to resolve without
+    # flooding the terminal for every one of the ~10 qualitative samples.
+    debug = not _DEBUG_STATE["printed"]
 
-    fig, axes = plt.subplots(
-        4,
-        n_columns,
-        figsize=(5 * n_columns, 16),
-        squeeze=False,
-    )
+    image_paths: Dict[str, Path] = {}
+    heatmaps: Dict[str, np.ndarray] = {}
+    mask: Optional[np.ndarray] = None
+
+    for condition in conditions:
+        row = row_lookup[condition]
+
+        image_path = find_image_for_sample(row, condition, dataset_root)
+
+        if image_path is not None:
+            image_paths[condition] = image_path
+        elif debug:
+            dataset = str(row.get("source_dataset", ""))
+            generator = str(row.get("source_generator", ""))
+            item_id = parse_item_id(str(sample_id), dataset, generator)
+            print(f"\n[DEBUG] Image unresolved: sample={sample_id!r} condition={condition!r}")
+            print(f"[DEBUG]   dataset={dataset!r} generator={generator!r} item_id={item_id!r}")
+            print(f"[DEBUG]   dataset_root={dataset_root} (exists={dataset_root.exists()})")
+
+        heatmap_key = (str(sample_id), condition)
+        heatmap_path = heatmap_mapping.get(heatmap_key)
+
+        if heatmap_path is not None:
+            heatmaps[condition] = load_heatmap(heatmap_path)
+        elif debug:
+            same_condition_keys = [
+                key for key in heatmap_mapping if key[1] == condition
+            ]
+            print(f"\n[DEBUG] Heatmap unresolved: looked up key={heatmap_key!r}")
+            print(f"[DEBUG]   {len(same_condition_keys)} keys exist for condition={condition!r}; first 5:")
+            for key in same_condition_keys[:5]:
+                print(f"[DEBUG]     {key!r}")
+
+        if mask is None:
+            mask_path = find_mask_for_sample(row, dataset_root)
+
+            if mask_path is not None:
+                mask = load_mask(mask_path)
+            elif debug:
+                dataset = str(row.get("source_dataset", ""))
+                generator = str(row.get("source_generator", ""))
+                item_id = parse_item_id(str(sample_id), dataset, generator)
+                expected = dataset_root / "masks" / f"{dataset}_masks" / f"{item_id}.jpg"
+                print(f"\n[DEBUG] Mask unresolved: expected path={expected} (exists={expected.exists()})")
+
+    _DEBUG_STATE["printed"] = True
 
     source_dataset = str(rows.iloc[0].get("source_dataset", "Unknown"))
     source_generator = str(rows.iloc[0].get("source_generator", "Unknown"))
 
-    fig.suptitle(
+    title = (
         experiment_title(metadata)
         + f"\nSample: {sample_id} | Dataset: {source_dataset} | "
-        f"Generator: {source_generator}",
-        fontsize=14,
+        f"Generator: {source_generator}"
     )
 
-    mask = None
-
-    for column, condition in enumerate(conditions):
-        row = row_lookup[condition]
-
-        image_path = find_image_for_sample(row, condition)
-        heatmap_path = heatmap_mapping.get((str(sample_id), condition))
-
-        image = None
-        heatmap = None
-
-        if image_path is not None:
-            image = load_rgb_image(image_path)
-
-        if heatmap_path is not None:
-            heatmap = load_heatmap(heatmap_path)
-
-        if mask is None:
-            mask_path = find_mask_for_sample(row)
-
-            if mask_path is not None:
-                mask = load_mask(mask_path)
-
-        label = CONDITION_LABELS.get(condition, condition)
-
-        axes[0, column].set_title(label, fontsize=12)
-
-        if image is not None:
-            axes[0, column].imshow(image)
-        else:
-            axes[0, column].text(
-                0.5,
-                0.5,
-                "Image unavailable",
-                ha="center",
-                va="center",
-            )
-
-        axes[0, column].set_ylabel("Input Image")
-
-        if heatmap is not None:
-            axes[1, column].imshow(
-                heatmap,
-                cmap="inferno",
-            )
-            axes[1, column].set_title(
-                f"{label}\nReconstruction Error"
-            )
-        else:
-            axes[1, column].text(
-                0.5,
-                0.5,
-                "Heatmap unavailable",
-                ha="center",
-                va="center",
-            )
-
-        axes[1, column].set_ylabel("Error Heatmap")
-
-        if image is not None and heatmap is not None:
-            axes[2, column].imshow(
-                overlay_heatmap(image, heatmap)
-            )
-        else:
-            axes[2, column].text(
-                0.5,
-                0.5,
-                "Overlay unavailable",
-                ha="center",
-                va="center",
-            )
-
-        axes[2, column].set_ylabel("Overlay")
-
-        if mask is not None:
-            axes[3, column].imshow(
-                mask,
-                cmap="gray",
-                vmin=0,
-                vmax=1,
-            )
-        else:
-            axes[3, column].text(
-                0.5,
-                0.5,
-                "Mask unavailable",
-                ha="center",
-                va="center",
-            )
-
-        axes[3, column].set_ylabel("Ground Truth Mask")
-
-        for row_index in range(4):
-            axes[row_index, column].axis("off")
-
-    save_figure(fig, output_path, dpi=dpi, show=show)
+    save_visualization(
+        image_paths,
+        mask,
+        heatmaps,
+        output_path,
+        title=title,
+        dpi=dpi,
+        show=show,
+    )
 
     return True
 
@@ -1983,6 +2130,7 @@ def main() -> None:
     metrics_dir = args.metrics_dir
     heatmaps_dir = args.heatmaps_dir
     output_dir = args.output_dir
+    dataset_root = args.dataset_root
 
     directories = ensure_output_dirs(output_dir)
 
@@ -1991,6 +2139,7 @@ def main() -> None:
     print("=" * 72)
     print(f"Metrics directory : {metrics_dir}")
     print(f"Heatmaps directory: {heatmaps_dir}")
+    print(f"Dataset root      : {dataset_root} (exists={dataset_root.exists()})")
     print(f"Output directory  : {output_dir}")
     print()
 
@@ -2097,6 +2246,7 @@ def main() -> None:
                 sample_id,
                 sample_metrics,
                 heatmap_mapping,
+                args.dataset_root,
                 comparative_path,
                 metadata,
                 args.dpi,
@@ -2106,22 +2256,23 @@ def main() -> None:
             if success:
                 generated_files.append(comparative_path)
 
-            difference_path = (
-                directories["qualitative"]
-                / f"sample_{safe_id}_standard_minus_inpx.png"
-            )
+            if args.difference_maps:
+                difference_path = (
+                    directories["qualitative"]
+                    / f"sample_{safe_id}_standard_minus_inpx.png"
+                )
 
-            success = plot_difference_map(
-                sample_id,
-                heatmap_mapping,
-                difference_path,
-                metadata,
-                args.dpi,
-                args.show,
-            )
+                success = plot_difference_map(
+                    sample_id,
+                    heatmap_mapping,
+                    difference_path,
+                    metadata,
+                    args.dpi,
+                    args.show,
+                )
 
-            if success:
-                generated_files.append(difference_path)
+                if success:
+                    generated_files.append(difference_path)
 
         # -----------------------------------------------------------
         # Sample-level reconstruction-error plots

@@ -1,32 +1,13 @@
 """
-AEROBLADE × INP-X smoke-test experiment.
+AEROBLADE x INP-X High-Throughput Multi-Triplet Batched Experiment.
 
-Runs the AEROBLADE reconstruction-error pipeline on a frozen INP-X smoke
-manifest for three matched conditions:
-
-    original image
-    standard inpainting
-    INP-X inpainting exchange
-
-The script deliberately keeps the experiment self-contained in one file.
-It reuses AEROBLADE's `_PatchedLPIPS` and Diffusers latent-retrieval logic,
-while streaming the decoded reconstruction directly into LPIPS instead of
-writing/reloading PNGs.
-
-Outputs are written under --output-dir and include:
-    config.yaml
-    heatmaps/*.npy
-    reconstructions/*.png        (optional)
-    visualizations/*.png
-    sample_metrics.csv
-    detection_metrics.csv
-    localization_metrics.csv
-    evidence_metrics.csv
-    run_summary.csv
-
-The smoke test is intended as a controlled, diagnostic experiment rather
-than a final benchmark. Threshold-dependent metrics are explicitly marked
-with their thresholding rule; AP/AUC metrics are threshold-free.
+Optimized & Mathematically Calibrated Pipeline:
+1. Multi-triplet GPU batching: Evaluates B triplets simultaneously (B * 3 images per forward pass).
+2. Channels-last memory layout & FP16 autocast on Tensor Cores.
+3. Multi-worker prefetched PyTorch DataLoader for zero GPU starvation.
+4. Option A (AEROBLADE alignment): Negated reconstruction error (-E) as anomaly score.
+5. Inverted/calibrated thresholding for spatial localization (Otsu on -E, plus IoU_max/Dice_max).
+6. Removed internal Matplotlib plotting loop; plotting is decoupled to smoke_test_visualization.py.
 """
 
 from __future__ import annotations
@@ -36,11 +17,12 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
+import torch.utils.data as data
 import torchvision.transforms.v2 as tf
 from PIL import Image
 from scipy import ndimage
@@ -58,9 +40,6 @@ import yaml
 # ---------------------------------------------------------------------------
 # AEROBLADE imports
 # ---------------------------------------------------------------------------
-# The repository is expected at:
-#     <project_root>/external/aeroblade/src
-# Adjust --aeroblade-src if your checkout uses a different layout.
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_AEROBLADE_SRC = PROJECT_ROOT / "external" / "aeroblade" / "src"
 
@@ -73,18 +52,12 @@ from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img impo
     retrieve_latents,
 )
 
-
-CONDITIONS = {
-    "original": "original_path",
-    "standard": "standard_inpainting_path",
-    "inpx": "inpainting_exchange_path",
-}
+CONDITIONS = ["original", "standard", "inpx"]
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse experiment settings while keeping all important parameters explicit."""
     parser = argparse.ArgumentParser(
-        description="Run the AEROBLADE × INP-X controlled smoke test."
+        description="Run the optimized AEROBLADE x INP-X multi-triplet batched experiment."
     )
     parser.add_argument(
         "--manifest",
@@ -128,6 +101,18 @@ def parse_args() -> argparse.Namespace:
         help="Compute device. Defaults to CUDA when available.",
     )
     parser.add_argument(
+        "--triplet-batch-size",
+        type=int,
+        default=4,
+        help="Number of triplets to batch simultaneously (e.g. 4 triplets = 12 images per VAE pass).",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=2,
+        help="DataLoader worker processes for background image prefetching.",
+    )
+    parser.add_argument(
         "--save-reconstructions",
         action="store_true",
         help="Save decoded AE reconstructions as PNG files for visual inspection.",
@@ -137,11 +122,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional cap for debugging. By default, process the whole manifest.",
-    )
-    parser.add_argument(
-        "--visualizations",
-        action="store_true",
-        help="Save diagnostic image/mask/heatmap panels.",
     )
     parser.add_argument(
         "--heatmap-dtype",
@@ -158,13 +138,70 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# Dataset & DataLoader for zero GPU starvation
+# ---------------------------------------------------------------------------
+class InpXTripletDataset(data.Dataset):
+    """Prefetches matched INP-X triplets with background multi-threading."""
+
+    def __init__(self, df: pd.DataFrame):
+        self.df = df.reset_index(drop=True)
+        self.transform = tf.Compose([tf.ToImage(), tf.ToDtype(torch.float32, scale=True)])
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, idx: int) -> dict:
+        row = self.df.iloc[idx]
+        sample_id = str(row["sample_id"])
+
+        orig_path = Path(row["original_path"])
+        std_path = Path(row["standard_inpainting_path"])
+        inpx_path = Path(row["inpainting_exchange_path"])
+        mask_path = Path(row["mask_path"])
+
+        for p in [orig_path, std_path, inpx_path, mask_path]:
+            if not p.exists():
+                raise FileNotFoundError(f"Missing file for {sample_id}: {p}")
+
+        with Image.open(orig_path) as im:
+            orig_img = im.convert("RGB")
+            hw = (orig_img.height, orig_img.width)
+
+        with Image.open(std_path) as im:
+            std_img = im.convert("RGB")
+        with Image.open(inpx_path) as im:
+            inpx_img = im.convert("RGB")
+        with Image.open(mask_path) as im:
+            mask_img = im.convert("L")
+
+        if (std_img.height, std_img.width) != hw or (inpx_img.height, inpx_img.width) != hw:
+            raise ValueError(f"Shape mismatch in triplet {sample_id}")
+        if (mask_img.height, mask_img.width) != hw:
+            raise ValueError(f"Shape mismatch in mask {sample_id}")
+
+        orig_t = self.transform(orig_img)
+        std_t = self.transform(std_img)
+        inpx_t = self.transform(inpx_img)
+        mask_arr = (np.asarray(mask_img) > 127).astype(np.uint8)
+
+        return {
+            "sample_id": sample_id,
+            "source_dataset": str(row["source_dataset"]),
+            "source_generator": str(row["source_generator"]),
+            # Stacked triplet: [3, 3, H, W] in [0, 1]
+            "tensors": torch.stack([orig_t, std_t, inpx_t], dim=0),
+            "mask": torch.from_numpy(mask_arr),
+            "h": hw[0],
+            "w": hw[1],
+        }
+
+
 def setup_output_dirs(output_dir: Path) -> Dict[str, Path]:
-    """Create the complete output tree so the experiment never relies on pre-existing folders."""
     paths = {
         "root": output_dir,
         "heatmaps": output_dir / "heatmaps",
         "reconstructions": output_dir / "reconstructions",
-        "visualizations": output_dir / "visualizations",
         "metrics": output_dir / "metrics",
         "logs": output_dir / "logs",
     }
@@ -174,7 +211,6 @@ def setup_output_dirs(output_dir: Path) -> Dict[str, Path]:
 
 
 def save_config(args: argparse.Namespace, paths: Dict[str, Path]) -> None:
-    """Persist the exact experiment configuration alongside the numerical results."""
     config = {
         "experiment": "aeroblade_x_inpx_smoke_test",
         "manifest": str(args.manifest.resolve()),
@@ -185,28 +221,17 @@ def save_config(args: argparse.Namespace, paths: Dict[str, Path]) -> None:
         "lpips_spatial_layer_index": args.lpips_layer,
         "latent_sampling_seed": args.seed,
         "device": args.device or ("cuda" if torch.cuda.is_available() else "cpu"),
+        "triplet_batch_size": args.triplet_batch_size,
         "save_reconstructions": args.save_reconstructions,
         "heatmap_dtype": args.heatmap_dtype,
-        "heatmap_orientation": "positive_reconstruction_error",
+        "score_convention": "AEROBLADE native negative error (-E)",
+        "anomaly_map_convention": "A(x,y) = -E(x,y) (Option A)",
         "upsampling": "bilinear_antialias",
         "input_range": "[0,1] -> [-1,1] for VAE",
         "streaming_reconstruction": True,
-        "thresholded_localization_rule": "per-image Otsu",
-        "pixel_metrics": [
-            "pixel_f1",
-            "dice",
-            "iou",
-            "pixel_ap",
-            "pixel_roc_auc",
-            "boundary_f1",
-        ],
-        "image_metrics": [
-            "accuracy",
-            "precision",
-            "recall",
-            "f1",
-            "roc_auc",
-            "pr_auc",
+        "thresholded_localization_rules": [
+            "per-image Otsu on -E",
+            "swept optimal F1/IoU (IoU_max)",
         ],
     }
     with open(paths["root"] / "config.yaml", "w") as f:
@@ -214,7 +239,6 @@ def save_config(args: argparse.Namespace, paths: Dict[str, Path]) -> None:
 
 
 def load_ae(repo_id: str, device: str):
-    """Load the forensic autoencoder using the same Diffusers construction as the validation script."""
     pipe = AutoPipelineForImage2Image.from_pretrained(
         repo_id,
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
@@ -222,145 +246,35 @@ def load_ae(repo_id: str, device: str):
     )
     ae = pipe.vae.to(device)
     ae.eval()
+    if device == "cuda":
+        ae = ae.to(memory_format=torch.channels_last)
     return ae
 
 
 def setup_lpips(net: str, device: str):
-    """Instantiate AEROBLADE's spatial LPIPS implementation without modifying its model weights."""
     model = _PatchedLPIPS(spatial=True, net=net).to(device)
     model.eval()
+    if device == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     return model
 
 
-def load_rgb_tensor(path: Path) -> torch.Tensor:
-    """Load one RGB image using AEROBLADE's [0,1] preprocessing convention."""
-    transform = tf.Compose([tf.ToImage(), tf.ToDtype(torch.float32, scale=True)])
-    with Image.open(path) as image:
-        image = image.convert("RGB")
-        return transform(image).unsqueeze(0)
-
-
-def load_mask(path: Path, expected_hw: Tuple[int, int]) -> np.ndarray:
-    """Load and binarize an INP-X mask, verifying that it matches the image geometry."""
-    with Image.open(path) as image:
-        mask = np.asarray(image.convert("L"))
-
-    if mask.shape != expected_hw:
-        raise ValueError(
-            f"Mask shape {mask.shape} does not match image shape {expected_hw}: {path}"
-        )
-
-    return (mask > 127).astype(np.uint8)
-
-
-def reconstruct_and_score(
-    image_tensor: torch.Tensor,
-    ae,
-    lpips_model,
-    device: str,
-    seed: int,
-    layer_idx: int,
-) -> Tuple[np.ndarray, torch.Tensor]:
-    """
-    Reconstruct one image through the AE and return its positive spatial LPIPS error.
-
-    The implementation follows AEROBLADE's encode -> sampled latent -> decode
-    sequence and `[0,1] <-> [-1,1]` conversion. Unlike the upstream disk path,
-    the decoded tensor is sent directly to spatial LPIPS, avoiding PNG
-    quantization. The returned heatmap is deliberately NOT negated: larger
-    values therefore mean larger reconstruction error / stronger anomaly
-    evidence.
-    """
-    image_tensor = image_tensor.to(device)
-    ae_input = image_tensor.to(dtype=ae.dtype) * 2.0 - 1.0
-
-    generator = torch.Generator(device=device).manual_seed(seed)
-
-    with torch.inference_mode():
-        latents = retrieve_latents(ae.encode(ae_input), generator=generator)
-        decoded = ae.decode(latents.to(ae.dtype), return_dict=False)[0]
-        reconstruction = (decoded / 2.0 + 0.5).clamp(0, 1).float()
-
-        _, layer_outputs = lpips_model(
-            image_tensor,
-            reconstruction,
-            retPerLayer=True,
-            normalize=True,
-        )
-
-        spatial_error = layer_outputs[layer_idx]
-
-        _, _, height, width = image_tensor.shape
-        spatial_error = torch.nn.functional.interpolate(
-            spatial_error.float(),
-            size=(height, width),
-            mode="bilinear",
-            antialias=True,
-        )
-
-    heatmap = spatial_error[0, 0].detach().cpu().numpy().astype(np.float32)
-    return heatmap, reconstruction[0].detach().cpu()
-
-
-def save_heatmap(
-    heatmap: np.ndarray,
-    paths: Dict[str, Path],
-    sample_id: str,
-    condition: str,
-    ae_name: str,
-    lpips_net: str,
-    lpips_layer: int,
-    dtype: str,
-) -> Path:
-    """Save a heatmap with all parameters needed to identify the experiment later."""
-    safe_ae = ae_name.replace("/", "__")
-    filename = (
-        f"sample-{sample_id}"
-        f"__condition-{condition}"
-        f"__ae-{safe_ae}"
-        f"__distance-LPIPS"
-        f"__backbone-{lpips_net}"
-        f"__layer-{lpips_layer}"
-        f"__orientation-positive_error.npy"
-    )
-    output = paths["heatmaps"] / filename
-    np.save(output, heatmap.astype(np.float16 if dtype == "float16" else np.float32))
-    return output
-
-
-def save_reconstruction(
-    reconstruction: torch.Tensor,
-    paths: Dict[str, Path],
-    sample_id: str,
-    condition: str,
-    ae_name: str,
-) -> Path:
-    """Save an optional reconstruction using a descriptive, collision-resistant filename."""
-    safe_ae = ae_name.replace("/", "__")
-    output = (
-        paths["reconstructions"]
-        / f"sample-{sample_id}__condition-{condition}__ae-{safe_ae}__reconstruction.png"
-    )
-    image = tf.ToPILImage()(reconstruction.float().clamp(0, 1))
-    image.save(output)
-    return output
-
-
+# ---------------------------------------------------------------------------
+# Metric helpers
+# ---------------------------------------------------------------------------
 def boundary_map(mask: np.ndarray, radius: int = 1) -> np.ndarray:
-    """Extract a one-pixel morphological boundary around the positive mask region."""
     structure = ndimage.generate_binary_structure(2, 1)
     dilated = ndimage.binary_dilation(mask.astype(bool), structure=structure, iterations=radius)
     eroded = ndimage.binary_erosion(mask.astype(bool), structure=structure, iterations=radius)
     return np.logical_xor(dilated, eroded)
 
 
-def classify_heatmap_otsu(heatmap: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Threshold a heatmap with Otsu's between-class-variance criterion."""
-    values = heatmap.astype(np.float64).ravel()
+def classify_anomaly_otsu(anomaly_map: np.ndarray) -> Tuple[np.ndarray, float]:
+    values = anomaly_map.astype(np.float64).ravel()
     lo, hi = float(values.min()), float(values.max())
 
     if hi <= lo:
-        return np.zeros_like(heatmap, dtype=np.uint8), lo
+        return np.zeros_like(anomaly_map, dtype=np.uint8), lo
 
     hist, edges = np.histogram(values, bins=256, range=(lo, hi))
     centers = (edges[:-1] + edges[1:]) / 2.0
@@ -379,15 +293,54 @@ def classify_heatmap_otsu(heatmap: np.ndarray) -> Tuple[np.ndarray, float]:
         where=denominator > 0,
     )
     threshold = float(centers[int(np.argmax(score))])
-    prediction = (heatmap >= threshold).astype(np.uint8)
+    prediction = (anomaly_map >= threshold).astype(np.uint8)
     return prediction, threshold
+
+
+def compute_optimal_threshold_metrics(
+    y_true: np.ndarray,
+    anomaly_scores: np.ndarray,
+    n_quantiles: int = 50,
+) -> Tuple[float, float, float]:
+    if not y_true.any() or y_true.all():
+        return float("nan"), float("nan"), float("nan")
+
+    quantiles = np.linspace(0.02, 0.98, n_quantiles)
+    thresholds = np.quantile(anomaly_scores, quantiles)
+
+    best_iou = 0.0
+    best_f1 = 0.0
+    best_th = float(thresholds[0])
+
+    y_bool = y_true.astype(bool)
+    n_pos = y_bool.sum()
+
+    for th in thresholds:
+        pred_bool = anomaly_scores >= th
+        intersection = np.logical_and(y_bool, pred_bool).sum()
+        union = np.logical_or(y_bool, pred_bool).sum()
+
+        if union == 0:
+            continue
+
+        iou = intersection / union
+        pred_pos = pred_bool.sum()
+        precision = intersection / pred_pos if pred_pos > 0 else 0.0
+        recall = intersection / n_pos
+        f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+
+        if iou > best_iou:
+            best_iou = float(iou)
+            best_f1 = float(f1)
+            best_th = float(th)
+
+    return best_iou, best_f1, best_th
 
 
 def safe_binary_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
 ) -> Tuple[float, float, float, float]:
-    """Compute precision, recall, F1 and IoU while handling degenerate masks safely."""
     precision = precision_score(y_true, y_pred, zero_division=0)
     recall = recall_score(y_true, y_pred, zero_division=0)
     f1 = 2 * precision * recall / max(precision + recall, 1e-12)
@@ -400,21 +353,25 @@ def safe_binary_metrics(
 
 
 def compute_localization_metrics(
-    heatmap: np.ndarray,
+    raw_heatmap: np.ndarray,
     mask: np.ndarray,
 ) -> Dict[str, float]:
-    """Compute threshold-free and Otsu-thresholded pixel localization metrics for one map."""
     y_true = mask.astype(np.uint8).ravel()
-    scores = heatmap.astype(np.float64).ravel()
+    anomaly_map = -raw_heatmap
+    scores = anomaly_map.astype(np.float64).ravel()
 
     if np.unique(y_true).size == 2:
         pixel_auc = float(roc_auc_score(y_true, scores))
         pixel_ap = float(average_precision_score(y_true, scores))
+        iou_max, dice_max, optimal_th = compute_optimal_threshold_metrics(y_true, scores)
     else:
         pixel_auc = float("nan")
         pixel_ap = float("nan")
+        iou_max = float("nan")
+        dice_max = float("nan")
+        optimal_th = float("nan")
 
-    prediction, threshold = classify_heatmap_otsu(heatmap)
+    prediction, threshold = classify_anomaly_otsu(anomaly_map)
     precision, recall, f1, iou = safe_binary_metrics(
         y_true,
         prediction.ravel(),
@@ -437,6 +394,9 @@ def compute_localization_metrics(
         "iou_otsu": iou,
         "boundary_f1_otsu": boundary_f1,
         "otsu_threshold": threshold,
+        "iou_max": iou_max,
+        "dice_max": dice_max,
+        "optimal_threshold": optimal_th,
     }
 
 
@@ -444,7 +404,6 @@ def compute_evidence_metrics(
     heatmap: np.ndarray,
     mask: np.ndarray,
 ) -> Dict[str, float]:
-    """Measure where reconstruction-error energy is concentrated relative to the ground-truth mask."""
     mask_bool = mask.astype(bool)
     boundary = boundary_map(mask)
     near_context = ndimage.binary_dilation(mask_bool, iterations=10) & ~mask_bool
@@ -456,65 +415,29 @@ def compute_evidence_metrics(
     context_energy = float(np.sum(heatmap[near_context])) if near_context.any() else 0.0
     background_energy = float(np.sum(heatmap[global_background])) if global_background.any() else 0.0
 
+    mean_inside = float(np.mean(heatmap[mask_bool])) if mask_bool.any() else np.nan
+    mean_bg = float(np.mean(heatmap[global_background])) if global_background.any() else np.nan
+
     return {
-        "mean_error_inside": float(np.mean(heatmap[mask_bool])) if mask_bool.any() else np.nan,
+        "mean_error_inside": mean_inside,
         "mean_error_boundary": float(np.mean(heatmap[boundary])) if boundary.any() else np.nan,
         "mean_error_near_context": float(np.mean(heatmap[near_context])) if near_context.any() else np.nan,
-        "mean_error_background": float(np.mean(heatmap[global_background])) if global_background.any() else np.nan,
+        "mean_error_background": mean_bg,
         "energy_fraction_inside": inside / total,
         "energy_fraction_boundary": boundary_energy / total,
         "energy_fraction_near_context": context_energy / total,
         "energy_fraction_background": background_energy / total,
-        "inside_background_contrast": (
-            float(np.mean(heatmap[mask_bool]) / (np.mean(heatmap[global_background]) + 1e-12))
-            if mask_bool.any() and global_background.any()
-            else np.nan
-        ),
+        "inside_background_contrast": (mean_inside / (mean_bg + 1e-12)) if (mask_bool.any() and global_background.any()) else np.nan,
+        "anomaly_contrast": (mean_bg / (mean_inside + 1e-12)) if (mask_bool.any() and global_background.any()) else np.nan,
     }
 
 
-def save_visualization(
-    image_paths: Dict[str, Path],
-    mask: np.ndarray,
-    heatmaps: Dict[str, np.ndarray],
-    output: Path,
-) -> None:
-    """Save a compact diagnostic panel for qualitative alignment and signal inspection."""
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-    axes = axes.ravel()
-
-    for ax, condition in zip(axes[:3], ["original", "standard", "inpx"]):
-        with Image.open(image_paths[condition]) as image:
-            ax.imshow(image.convert("RGB"))
-        ax.set_title(condition)
-        ax.axis("off")
-
-    axes[3].imshow(mask, cmap="gray")
-    axes[3].set_title("ground-truth mask")
-    axes[3].axis("off")
-
-    for ax, condition in zip(axes[4:], ["original", "standard", "inpx"]):
-        im = ax.imshow(heatmaps[condition])
-        # ax.imshow(mask, alpha=0.25)  //Uncomment this if you want to see the mask plotted above the heatmap
-        ax.set_title(f"{condition}: positive LPIPS error")
-        ax.axis("off")
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    axes[7].axis("off")
-    fig.tight_layout()
-    fig.savefig(output, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
 def image_level_metrics(
-    scores: Iterable[float],
-    labels: Iterable[int],
+    scores: np.ndarray,
+    labels: np.ndarray,
 ) -> Dict[str, float]:
-    """Compute image-level detection metrics from reconstruction-error scores."""
-    scores = np.asarray(list(scores), dtype=np.float64)
-    labels = np.asarray(list(labels), dtype=np.uint8)
+    scores = np.asarray(scores, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.uint8)
 
     if np.unique(labels).size < 2:
         return {
@@ -525,10 +448,9 @@ def image_level_metrics(
             "roc_auc": np.nan,
             "pr_auc": np.nan,
             "threshold": np.nan,
+            "tn": 0, "fp": 0, "fn": 0, "tp": 0,
         }
 
-    # For the smoke-test diagnostic report, use the midpoint between the
-    # class means. This is descriptive, not a trained detector.
     negative_mean = scores[labels == 0].mean()
     positive_mean = scores[labels == 1].mean()
     threshold = float((negative_mean + positive_mean) / 2.0)
@@ -559,14 +481,15 @@ def image_level_metrics(
     }
 
 
+# ---------------------------------------------------------------------------
+# Main Execution Loop
+# ---------------------------------------------------------------------------
 def main() -> None:
-    """Run the complete smoke experiment and persist maps, reconstructions, metrics, and metadata."""
     args = parse_args()
 
     if not args.aeroblade_src.exists():
         raise FileNotFoundError(f"AEROBLADE source directory not found: {args.aeroblade_src}")
 
-    # Put the requested repository source first in the import path.
     sys.path.insert(0, str(args.aeroblade_src))
 
     paths = setup_output_dirs(args.output_dir)
@@ -579,26 +502,29 @@ def main() -> None:
     if args.max_samples is not None:
         df = df.head(args.max_samples).copy()
 
-    required_columns = {
-        "sample_id",
-        "source_dataset",
-        "source_generator",
-        "original_path",
-        "standard_inpainting_path",
-        "inpainting_exchange_path",
-        "mask_path",
-    }
-    missing = required_columns - set(df.columns)
-    if missing:
-        raise ValueError(f"Manifest is missing required columns: {sorted(missing)}")
-
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    print(f"Manifest: {args.manifest}")
-    print(f"Samples: {len(df)}")
-    print(f"AE: {args.ae_repo_id}")
-    print(f"LPIPS: {args.lpips_net}, spatial layer {args.lpips_layer}")
-    print(f"Seed: {args.seed}")
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    print(f"============================================================")
+    print(f"AEROBLADE x INP-X Fast Multi-Triplet Batched Pipeline")
+    print(f"Device              : {device}")
+    print(f"Total Samples       : {len(df)} triplets ({len(df) * 3} images)")
+    print(f"Triplet Batch Size  : {args.triplet_batch_size} ({args.triplet_batch_size * 3} images/pass)")
+    print(f"Forensic AE         : {args.ae_repo_id}")
+    print(f"LPIPS               : {args.lpips_net}, spatial layer {args.lpips_layer}")
+    print(f"DataLoader Workers  : {args.num_workers}")
+    print(f"Score Convention    : Option A (-E, higher = more anomalous)")
+    print(f"============================================================\n")
+
+    dataset = InpXTripletDataset(df)
+    loader = data.DataLoader(
+        dataset,
+        batch_size=args.triplet_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device == "cuda"),
+    )
 
     ae = load_ae(args.ae_repo_id, device)
     lpips_model = setup_lpips(args.lpips_net, device)
@@ -606,121 +532,130 @@ def main() -> None:
     sample_records = []
     localization_records = []
     evidence_records = []
+
     detection_scores = []
     detection_labels = []
 
     started = time.time()
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="AEROBLADE × INP-X smoke test"):
-        sample_id = str(row["sample_id"])
+    for batch in tqdm(loader, desc="Evaluating Batches"):
+        b_samples = len(batch["sample_id"])
+        sample_ids = batch["sample_id"]
+        source_datasets = batch["source_dataset"]
+        source_generators = batch["source_generator"]
+        masks = batch["mask"].numpy()  # [B, H, W]
+        heights = batch["h"].numpy()
+        widths = batch["w"].numpy()
 
-        image_paths = {
-            condition: Path(row[path_column])
-            for condition, path_column in CONDITIONS.items()
-        }
-        mask_path = Path(row["mask_path"])
+        # batch["tensors"] is [B, 3, 3, H, W] -> flatten to [B * 3, 3, H, W]
+        flat_tensors = batch["tensors"].view(b_samples * 3, 3, heights[0], widths[0])
+        flat_tensors = flat_tensors.to(device, non_blocking=True)
+        if device == "cuda":
+            flat_tensors = flat_tensors.to(memory_format=torch.channels_last)
 
-        for path in [*image_paths.values(), mask_path]:
-            if not path.exists():
-                raise FileNotFoundError(f"Missing input for {sample_id}: {path}")
+        generator = torch.Generator(device=device).manual_seed(args.seed)
 
-        # All three conditions must preserve the same geometry.
-        with Image.open(image_paths["original"]) as image:
-            expected_hw = (image.height, image.width)
+        # -------------------------------------------------------------------
+        # Batched Forward Pass: All B * 3 images evaluated in a single step!
+        # -------------------------------------------------------------------
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=(device == "cuda")):
+                ae_input = flat_tensors.to(dtype=ae.dtype) * 2.0 - 1.0
+                latents = retrieve_latents(ae.encode(ae_input), generator=generator)
+                decoded = ae.decode(latents.to(ae.dtype), return_dict=False)[0]
+                reconstructions = (decoded / 2.0 + 0.5).clamp(0, 1).float()
 
-        mask = load_mask(mask_path, expected_hw)
-        heatmaps = {}
-
-        for condition, image_path in image_paths.items():
-            image_tensor = load_rgb_tensor(image_path)
-
-            if tuple(image_tensor.shape[-2:]) != expected_hw:
-                raise ValueError(
-                    f"Geometry mismatch for {sample_id}/{condition}: "
-                    f"{tuple(image_tensor.shape[-2:])} vs {expected_hw}"
+                _, layer_outputs = lpips_model(
+                    flat_tensors,
+                    reconstructions,
+                    retPerLayer=True,
+                    normalize=True,
                 )
 
-            heatmap, reconstruction = reconstruct_and_score(
-                image_tensor=image_tensor,
-                ae=ae,
-                lpips_model=lpips_model,
-                device=device,
-                seed=args.seed,
-                layer_idx=args.lpips_layer,
-            )
-            heatmaps[condition] = heatmap
-
-            save_heatmap(
-                heatmap=heatmap,
-                paths=paths,
-                sample_id=sample_id,
-                condition=condition,
-                ae_name=args.ae_repo_id,
-                lpips_net=args.lpips_net,
-                lpips_layer=args.lpips_layer,
-                dtype=args.heatmap_dtype,
-            )
-
-            if args.save_reconstructions:
-                save_reconstruction(
-                    reconstruction=reconstruction,
-                    paths=paths,
-                    sample_id=sample_id,
-                    condition=condition,
-                    ae_name=args.ae_repo_id,
+                spatial_error = layer_outputs[args.lpips_layer]  # [B * 3, 1, h, w]
+                spatial_error = torch.nn.functional.interpolate(
+                    spatial_error.float(),
+                    size=(int(heights[0]), int(widths[0])),
+                    mode="bilinear",
+                    antialias=True,
                 )
 
-        # The same scalar score used for image-level detection is the mean
-        # positive reconstruction error over the complete spatial field.
-        for condition, heatmap in heatmaps.items():
-            score = float(np.mean(heatmap))
-            label = 0 if condition == "original" else 1
-            detection_scores.append(score)
-            detection_labels.append(label)
+        # Reshape spatial maps back to [B, 3, H, W]
+        spatial_maps = spatial_error[:, 0].view(b_samples, 3, int(heights[0]), int(widths[0])).detach().cpu().numpy().astype(np.float32)
 
-            loc = compute_localization_metrics(heatmap, mask)
-            evidence = compute_evidence_metrics(heatmap, mask)
+        # Optional reconstruction saving
+        if args.save_reconstructions:
+            safe_ae = args.ae_repo_id.replace("/", "__")
+            flat_recs = reconstructions.detach().cpu()
+            for b_idx in range(b_samples):
+                s_id = sample_ids[b_idx]
+                for c_idx, condition in enumerate(CONDITIONS):
+                    rec_img = tf.ToPILImage()(flat_recs[b_idx * 3 + c_idx].clamp(0, 1))
+                    rec_path = paths["reconstructions"] / f"sample-{s_id}__condition-{condition}__ae-{safe_ae}__reconstruction.png"
+                    rec_img.save(rec_path)
 
-            common = {
-                "sample_id": sample_id,
-                "source_dataset": row["source_dataset"],
-                "source_generator": row["source_generator"],
-                "condition": condition,
-                "width": expected_hw[1],
-                "height": expected_hw[0],
-                "image_score_mean_error": score,
+        # Process metrics for each triplet in this batch
+        safe_ae = args.ae_repo_id.replace("/", "__")
+        for b_idx in range(b_samples):
+            s_id = sample_ids[b_idx]
+            s_ds = source_datasets[b_idx]
+            s_gen = source_generators[b_idx]
+            mask = masks[b_idx]
+            hw = (int(heights[b_idx]), int(widths[b_idx]))
+
+            heatmaps = {
+                "original": spatial_maps[b_idx, 0],
+                "standard": spatial_maps[b_idx, 1],
+                "inpx": spatial_maps[b_idx, 2],
             }
 
-            localization_records.append({**common, **loc})
-            evidence_records.append({**common, **evidence})
+            for condition in CONDITIONS:
+                heatmap = heatmaps[condition]
 
-            sample_records.append(
-                {
-                    **common,
-                    "heatmap_min": float(np.min(heatmap)),
-                    "heatmap_mean": float(np.mean(heatmap)),
-                    "heatmap_std": float(np.std(heatmap)),
-                    "heatmap_max": float(np.max(heatmap)),
+                # Save heatmap .npy
+                npy_path = paths["heatmaps"] / (
+                    f"sample-{s_id}__condition-{condition}__ae-{safe_ae}"
+                    f"__distance-LPIPS__backbone-{args.lpips_net}__layer-{args.lpips_layer}"
+                    f"__orientation-positive_error.npy"
+                )
+                np.save(npy_path, heatmap.astype(np.float16 if args.heatmap_dtype == "float16" else np.float32))
+
+                mean_error = float(np.mean(heatmap))
+                aeroblade_score = -mean_error
+                label = 0 if condition == "original" else 1
+
+                detection_scores.append(aeroblade_score)
+                detection_labels.append(label)
+
+                common = {
+                    "sample_id": s_id,
+                    "source_dataset": s_ds,
+                    "source_generator": s_gen,
+                    "condition": condition,
+                    "width": hw[1],
+                    "height": hw[0],
+                    "image_score_mean_error": mean_error,
+                    "image_score_aeroblade": aeroblade_score,
                 }
-            )
 
-        if args.visualizations:
-            visualization_name = (
-                f"sample-{sample_id}"
-                f"__ae-{args.ae_repo_id.replace('/', '__')}"
-                f"__distance-LPIPS"
-                f"__backbone-{args.lpips_net}"
-                f"__layer-{args.lpips_layer}.png"
-            )
-            save_visualization(
-                image_paths=image_paths,
-                mask=mask,
-                heatmaps=heatmaps,
-                output=paths["visualizations"] / visualization_name,
-            )
+                loc = compute_localization_metrics(heatmap, mask)
+                evidence = compute_evidence_metrics(heatmap, mask)
+
+                localization_records.append({**common, **loc})
+                evidence_records.append({**common, **evidence})
+
+                sample_records.append(
+                    {
+                        **common,
+                        "heatmap_min": float(np.min(heatmap)),
+                        "heatmap_mean": mean_error,
+                        "heatmap_std": float(np.std(heatmap)),
+                        "heatmap_max": float(np.max(heatmap)),
+                    }
+                )
 
     # -----------------------------------------------------------------------
-    # Persist per-sample / per-condition tables.
+    # Persist metrics tables
     # -----------------------------------------------------------------------
     sample_df = pd.DataFrame(sample_records)
     loc_df = pd.DataFrame(localization_records)
@@ -730,63 +665,38 @@ def main() -> None:
     loc_df.to_csv(paths["metrics"] / "localization_metrics.csv", index=False)
     evidence_df.to_csv(paths["metrics"] / "evidence_metrics.csv", index=False)
 
-    # Detection is deliberately computed across all original vs manipulated
-    # condition observations. The condition-specific rows make the comparison
-    # directly inspectable, while the aggregate row answers "does the score
-    # separate authentic from manipulated images?".
-    detection = image_level_metrics(detection_scores, detection_labels)
-    detection_row = {
-        "experiment": "aeroblade_x_inpx_smoke_test",
-        "ae": args.ae_repo_id,
-        "lpips_backbone": args.lpips_net,
-        "lpips_layer": args.lpips_layer,
-        "score": "mean_positive_spatial_reconstruction_error",
-        "positive_class": "standard_or_inpx",
-        "threshold_rule": "midpoint_between_negative_and_positive_class_means",
-        "n_images": len(detection_scores),
-        **detection,
-    }
-
-    # Also report standard-vs-original and INP-X-vs-original separately.
+    # -----------------------------------------------------------------------
+    # Detection metrics
+    # -----------------------------------------------------------------------
+    detection_rows_list = []
     for manipulated_condition in ["standard", "inpx"]:
         subset = sample_df[sample_df["condition"].isin(["original", manipulated_condition])]
-        scores = subset["image_score_mean_error"].to_numpy()
+        scores = subset["image_score_aeroblade"].to_numpy()
         labels = (subset["condition"] == manipulated_condition).astype(np.uint8).to_numpy()
         row_metrics = image_level_metrics(scores, labels)
-        detection_rows = {
+        row = {
             "experiment": "aeroblade_x_inpx_smoke_test",
             "ae": args.ae_repo_id,
             "lpips_backbone": args.lpips_net,
             "lpips_layer": args.lpips_layer,
-            "score": "mean_positive_spatial_reconstruction_error",
+            "score": "aeroblade_negative_mean_error",
             "positive_class": manipulated_condition,
             "threshold_rule": "midpoint_between_negative_and_positive_class_means",
             "n_images": len(scores),
+            "comparison": f"{manipulated_condition}_vs_original",
             **row_metrics,
         }
-        detection_rows["comparison"] = f"{manipulated_condition}_vs_original"
-        if "comparison" not in detection_row:
-            detection_row["comparison"] = "standard_and_inpx_vs_original"
-
-        if "detection_rows_list" not in locals():
-            detection_rows_list = []
-        detection_rows_list.append(detection_rows)
+        detection_rows_list.append(row)
 
     detection_df = pd.DataFrame(detection_rows_list)
     detection_df.to_csv(paths["metrics"] / "detection_metrics.csv", index=False)
 
     # -----------------------------------------------------------------------
-    # Standard -> INP-X degradation and retention.
-    # Retention is defined here as:
-    #     INP-X performance / Standard performance
-    # This is most meaningful for bounded higher-is-better metrics such as AP,
-    # AUC, Dice and IoU, and should be interpreted cautiously on a tiny smoke
-    # test. We therefore calculate it mechanically and preserve both source
-    # values in the report.
+    # Retention & Degradation
     # -----------------------------------------------------------------------
     loc_summary = (
         loc_df.groupby("condition")[
-            ["pixel_ap", "pixel_roc_auc", "dice_otsu", "iou_otsu", "boundary_f1_otsu"]
+            ["pixel_ap", "pixel_roc_auc", "dice_otsu", "iou_otsu", "boundary_f1_otsu", "iou_max", "dice_max"]
         ]
         .mean(numeric_only=True)
         .reset_index()
@@ -797,20 +707,16 @@ def main() -> None:
 
     summary_rows = []
     if not std_row.empty and not inpx_row.empty:
-        for metric in ["pixel_ap", "pixel_roc_auc", "dice_otsu", "iou_otsu", "boundary_f1_otsu"]:
-            standard_value = float(std_row.iloc[0][metric])
-            inpx_value = float(inpx_row.iloc[0][metric])
+        for metric in ["pixel_ap", "pixel_roc_auc", "dice_otsu", "iou_otsu", "boundary_f1_otsu", "iou_max", "dice_max"]:
+            std_val = float(std_row.iloc[0][metric])
+            inpx_val = float(inpx_row.iloc[0][metric])
             summary_rows.append(
                 {
                     "metric": metric,
-                    "standard_mean": standard_value,
-                    "inpx_mean": inpx_value,
-                    "degradation_absolute": inpx_value - standard_value,
-                    "retention_ratio": (
-                        inpx_value / standard_value
-                        if np.isfinite(standard_value) and standard_value != 0
-                        else np.nan
-                    ),
+                    "standard_mean": std_val,
+                    "inpx_mean": inpx_val,
+                    "degradation_absolute": inpx_val - std_val,
+                    "retention_ratio": (inpx_val / std_val) if (np.isfinite(std_val) and std_val != 0) else np.nan,
                 }
             )
 
@@ -832,7 +738,11 @@ def main() -> None:
                 "lpips_layer": args.lpips_layer,
                 "seed": args.seed,
                 "device": device,
+                "triplet_batch_size": args.triplet_batch_size,
                 "elapsed_seconds": elapsed,
+                "triplet_batching": True,
+                "channels_last": True,
+                "fp16_autocast": True,
                 "heatmap_count": len(list(paths["heatmaps"].glob("*.npy"))),
                 "reconstruction_count": len(list(paths["reconstructions"].glob("*.png"))),
             }
@@ -852,13 +762,15 @@ def main() -> None:
         )
 
     print("\n============================================================")
-    print("AEROBLADE × INP-X SMOKE TEST COMPLETE")
+    print("AEROBLADE x INP-X MULTI-TRIPLET SMOKE TEST COMPLETE")
     print("============================================================")
-    print(f"Samples processed : {len(df)}")
-    print(f"Heatmaps          : {paths['heatmaps']}")
-    print(f"Metrics           : {paths['metrics']}")
-    print(f"Visualizations    : {paths['visualizations']}")
-    print(f"Elapsed           : {elapsed / 60:.2f} min")
+    print(f"Triplets evaluated : {len(df)}")
+    print(f"Total images       : {len(df) * 3}")
+    print(f"Triplet batch size : {args.triplet_batch_size} ({args.triplet_batch_size * 3} images/step)")
+    print(f"Elapsed time       : {elapsed:.2f} s ({elapsed / 60:.2f} min)")
+    print(f"Speed              : {len(df) * 3 / max(elapsed, 1e-6):.2f} images/sec")
+    print(f"Heatmaps           : {paths['heatmaps']}")
+    print(f"Metrics            : {paths['metrics']}")
     print("============================================================")
 
 
